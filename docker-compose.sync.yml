@@ -9,8 +9,12 @@ services:
     environment:
       PORT: "8787"
       DB_PATH: "/data/sync.db"
+      TLS_CERT_PATH: "/certs/server.crt"
+      TLS_KEY_PATH: "/certs/server.key"
+      CORS_ORIGINS: "${CORS_ORIGINS:-}"
     volumes:
       - preptrack_sync_data:/data
+      - ./sync-backend/certs:/certs:ro
 
 volumes:
   preptrack_sync_data:

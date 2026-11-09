@@ -219,12 +219,10 @@ npm --prefix sync-backend run test # Sync backend integration tests only
 
 ### Optional LAN Sync Backend
 
-```bash
-docker compose -f docker-compose.sync.yml up -d --build
-curl http://localhost:8787/health
-```
-
-Open Settings in the app, enter your backend URL (for example `http://192.168.0.20:8787`), set a shared sync code, and pair each device.
+LAN sync requires a TLS certificate trusted by every device; an HTTPS-hosted
+PWA cannot connect to an HTTP LAN endpoint. Follow the
+[secure LAN deployment and backup/restore drill](docs/SECURE_LAN_SYNC.md) before
+pairing devices. Offline inventory use does not depend on this optional server.
 
 ### Deploy (GitHub Pages)
 

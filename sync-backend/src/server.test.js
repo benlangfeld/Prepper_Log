@@ -4,12 +4,13 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer, shouldApplyChange } from './server.js';
 
-async function setupServer() {
+async function setupServer(options = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'preptrack-sync-test-'));
   const dbPath = path.join(tempDir, 'sync.db');
   const { app } = await createServer({
     dbPath,
     logger: false,
+    ...options,
   });
   return { app, tempDir };
 }
@@ -68,8 +69,8 @@ describe('sync backend integration', () => {
     const ctx = await setupServer();
     openServers.push(ctx);
 
-    const first = await pairDevice(ctx.app, 'HOUSEHOLD-1234', 'Desktop');
-    const second = await pairDevice(ctx.app, 'HOUSEHOLD-1234', 'Phone');
+    const first = await pairDevice(ctx.app, 'HOUSEHOLD-CODE-1234', 'Desktop');
+    const second = await pairDevice(ctx.app, 'HOUSEHOLD-CODE-1234', 'Phone');
 
     expect(first.householdId).toBe(second.householdId);
     expect(first.deviceId).not.toBe(second.deviceId);
@@ -87,12 +88,31 @@ describe('sync backend integration', () => {
     expect(res.statusCode).toBe(401);
   });
 
+  it('only enables browser CORS for explicitly allowed origins', async () => {
+    const ctx = await setupServer({ corsOrigins: ['https://prep.example'] });
+    openServers.push(ctx);
+
+    const allowed = await ctx.app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { origin: 'https://prep.example' },
+    });
+    const denied = await ctx.app.inject({
+      method: 'GET',
+      url: '/health',
+      headers: { origin: 'https://untrusted.example' },
+    });
+
+    expect(allowed.headers['access-control-allow-origin']).toBe('https://prep.example');
+    expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
   it('supports push and pull with last-write-wins behavior', async () => {
     const ctx = await setupServer();
     openServers.push(ctx);
 
-    const desktop = await pairDevice(ctx.app, 'SYNC-CODE-1', 'Desktop');
-    const phone = await pairDevice(ctx.app, 'SYNC-CODE-1', 'Phone');
+    const desktop = await pairDevice(ctx.app, 'SYNC-CODE-1234567', 'Desktop');
+    const phone = await pairDevice(ctx.app, 'SYNC-CODE-1234567', 'Phone');
 
     const firstPush = await ctx.app.inject({
       method: 'POST',
@@ -176,8 +196,8 @@ describe('sync backend integration', () => {
     const ctx = await setupServer();
     openServers.push(ctx);
 
-    const deviceA = await pairDevice(ctx.app, 'SYNC-CODE-DELETE', 'Desktop');
-    const deviceB = await pairDevice(ctx.app, 'SYNC-CODE-DELETE', 'Phone');
+    const deviceA = await pairDevice(ctx.app, 'SYNC-CODE-DELETE-123', 'Desktop');
+    const deviceB = await pairDevice(ctx.app, 'SYNC-CODE-DELETE-123', 'Phone');
 
     await ctx.app.inject({
       method: 'POST',
@@ -237,7 +257,7 @@ describe('sync backend integration', () => {
     const ctx = await setupServer();
     openServers.push(ctx);
 
-    const paired = await pairDevice(ctx.app, 'SYNC-CODE-LIMIT', 'Desktop');
+    const paired = await pairDevice(ctx.app, 'SYNC-CODE-LIMIT-123', 'Desktop');
     const changes = Array.from({ length: 1001 }, (_, i) => ({
       entityType: 'product',
       entityId: `prod-${i}`,
@@ -254,5 +274,71 @@ describe('sync backend integration', () => {
     });
 
     expect(res.statusCode).toBe(400);
+  });
+
+  it('rejects short pair codes and limits repeated pairing attempts', async () => {
+    const ctx = await setupServer();
+    openServers.push(ctx);
+
+    const shortCode = await ctx.app.inject({
+      method: 'POST',
+      url: '/v1/pair',
+      payload: { syncCode: 'four', deviceName: 'Phone' },
+    });
+    expect(shortCode.statusCode).toBe(400);
+
+    for (let attempt = 0; attempt < 9; attempt += 1) {
+      const res = await ctx.app.inject({
+        method: 'POST',
+        url: '/v1/pair',
+        payload: { syncCode: 'SYNC-CODE-1234567', deviceName: 'Phone' },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+
+    const limited = await ctx.app.inject({
+      method: 'POST',
+      url: '/v1/pair',
+      payload: { syncCode: 'SYNC-CODE-1234567', deviceName: 'Phone' },
+    });
+    expect(limited.statusCode).toBe(429);
+  });
+
+  it('rejects an invalid push batch without applying any of its changes', async () => {
+    const ctx = await setupServer();
+    openServers.push(ctx);
+    const paired = await pairDevice(ctx.app, 'SYNC-CODE-INVALID-123', 'Desktop');
+
+    const res = await ctx.app.inject({
+      method: 'POST',
+      url: '/v1/sync/push',
+      headers: authHeaders(paired.deviceToken, paired.householdId),
+      payload: {
+        changes: [
+          {
+            entityType: 'product',
+            entityId: 'valid-product',
+            op: 'upsert',
+            updatedAt: '2026-03-10T12:00:00.000Z',
+            payload: { syncId: 'valid-product', name: 'Wasser', quantity: 1 },
+          },
+          {
+            entityType: 'product',
+            entityId: 'invalid-product',
+            op: 'upsert',
+            updatedAt: 'not-a-date',
+            payload: { syncId: 'different-id', name: 'Reis', quantity: 1 },
+          },
+        ],
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const pull = await ctx.app.inject({
+      method: 'GET',
+      url: '/v1/sync/pull?cursor=0',
+      headers: authHeaders(paired.deviceToken, paired.householdId),
+    });
+    expect(pull.json().changes).toHaveLength(0);
   });
 });
