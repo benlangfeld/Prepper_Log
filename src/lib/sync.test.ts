@@ -76,7 +76,7 @@ describe('sync runtime', () => {
 
     await pairSyncDevice({
       serverUrl: 'http://192.168.0.20:8787/',
-      syncCode: 'HOUSE-1234',
+      syncCode: 'HOUSEHOLD-CODE-1234',
       deviceName: 'Phone',
     });
 
@@ -177,5 +177,28 @@ describe('sync runtime', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
     expect(getSyncRuntimeState().status).toBe('idle');
     expect(getSyncRuntimeState().pendingChanges).toBe(7);
+  });
+
+  it('keeps queued changes when the server rejects a push', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(mockFetchResponse({ cursor: 0, changes: [] }))
+      .mockResolvedValueOnce(mockFetchResponse({ error: 'invalid change' }, false, 400));
+    dbMock.getQueuedSyncChanges.mockResolvedValueOnce([
+      {
+        id: 1,
+        entityType: 'product',
+        entitySyncId: 'prod-1',
+        op: 'upsert',
+        updatedAt: '2026-03-10T12:00:00.000Z',
+        payload: { syncId: 'prod-1', quantity: 1 },
+      },
+    ]);
+    dbMock.getSyncQueueCount.mockResolvedValue(1);
+
+    const { runSyncNow, getSyncRuntimeState } = await import('./sync');
+    await expect(runSyncNow('rejected-push')).rejects.toThrow('Push fehlgeschlagen (400)');
+
+    expect(dbMock.removeQueuedSyncChanges).not.toHaveBeenCalled();
+    expect(getSyncRuntimeState().pendingChanges).toBe(1);
   });
 });

@@ -8,6 +8,10 @@ import Database from 'better-sqlite3';
 
 const ENTITY_TYPES = new Set(['product', 'storageLocation', 'consumptionLog']);
 const OPERATIONS = new Set(['upsert', 'delete']);
+const MIN_SYNC_CODE_LENGTH = 16;
+const MAX_PAIR_ATTEMPTS = 10;
+const PAIR_WINDOW_MS = 15 * 60 * 1000;
+const MAX_PAIR_CLIENTS = 4096;
 
 function nowIso() {
   return new Date().toISOString();
@@ -103,16 +107,56 @@ function parseCorsOrigins(value) {
     .filter(Boolean);
 }
 
+function validateChange(change) {
+  if (!change || typeof change !== 'object' || Array.isArray(change)) return false;
+  if (!ENTITY_TYPES.has(change.entityType) || !OPERATIONS.has(change.op)) return false;
+  if (
+    typeof change.entityId !== 'string' ||
+    change.entityId.trim().length === 0 ||
+    change.entityId.length > 256
+  ) {
+    return false;
+  }
+  if (
+    typeof change.updatedAt !== 'string' ||
+    change.updatedAt.length > 64 ||
+    !Number.isFinite(Date.parse(change.updatedAt))
+  ) {
+    return false;
+  }
+  if (change.op === 'upsert') {
+    return (
+      change.payload !== null &&
+      typeof change.payload === 'object' &&
+      !Array.isArray(change.payload) &&
+      change.payload.syncId === change.entityId
+    );
+  }
+  return true;
+}
+
 export async function createServer(options = {}) {
   const port = Number.parseInt(String(options.port ?? process.env.PORT ?? '8787'), 10);
   const requestedDbPath = String(options.dbPath ?? process.env.DB_PATH ?? '/data/sync.db');
   const corsOrigins = Array.isArray(options.corsOrigins)
     ? options.corsOrigins
     : parseCorsOrigins(options.corsOrigins ?? process.env.CORS_ORIGINS ?? '');
+  const tlsCertPath = String(options.tlsCertPath ?? process.env.TLS_CERT_PATH ?? '');
+  const tlsKeyPath = String(options.tlsKeyPath ?? process.env.TLS_KEY_PATH ?? '');
+  if (Boolean(tlsCertPath) !== Boolean(tlsKeyPath)) {
+    throw new Error('TLS_CERT_PATH und TLS_KEY_PATH müssen gemeinsam gesetzt werden.');
+  }
+  const https = tlsCertPath
+    ? {
+        cert: fs.readFileSync(tlsCertPath),
+        key: fs.readFileSync(tlsKeyPath),
+      }
+    : undefined;
   const logger = options.logger === true;
 
   const resolvedDbPath = resolveDbPath(requestedDbPath);
   const db = initDb(resolvedDbPath);
+  const pairAttempts = new Map();
 
   const findHouseholdByCode = db.prepare(
     'SELECT id FROM households WHERE sync_code_hash = ? LIMIT 1'
@@ -163,6 +207,7 @@ export async function createServer(options = {}) {
   const app = Fastify({
     logger,
     bodyLimit: 15 * 1024 * 1024,
+    https,
   });
 
   app.decorateRequest('syncContext', null);
@@ -170,10 +215,6 @@ export async function createServer(options = {}) {
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin) {
-        cb(null, true);
-        return;
-      }
-      if (corsOrigins.length === 0) {
         cb(null, true);
         return;
       }
@@ -190,13 +231,39 @@ export async function createServer(options = {}) {
   });
 
   app.post('/v1/pair', async (request, reply) => {
+    const attemptTime = Date.now();
+    const clientIp = request.ip;
+    let attempts = pairAttempts.get(clientIp);
+    if (!attempts || attemptTime - attempts.startedAt >= PAIR_WINDOW_MS) {
+      attempts = { startedAt: attemptTime, count: 0 };
+      pairAttempts.set(clientIp, attempts);
+    }
+    if (attempts.count >= MAX_PAIR_ATTEMPTS) {
+      reply.code(429);
+      return { error: 'Zu viele Pairing-Versuche. Bitte später erneut versuchen.' };
+    }
+    attempts.count += 1;
+    if (pairAttempts.size > MAX_PAIR_CLIENTS) {
+      for (const [ip, entry] of pairAttempts) {
+        if (attemptTime - entry.startedAt >= PAIR_WINDOW_MS) pairAttempts.delete(ip);
+      }
+      while (pairAttempts.size > MAX_PAIR_CLIENTS) {
+        pairAttempts.delete(pairAttempts.keys().next().value);
+      }
+    }
+
     const body = request.body && typeof request.body === 'object' ? request.body : {};
     const syncCode = typeof body.syncCode === 'string' ? body.syncCode.trim() : '';
     const deviceName = typeof body.deviceName === 'string' ? body.deviceName.trim() : '';
 
-    if (syncCode.length < 4 || deviceName.length < 2) {
+    if (
+      syncCode.length < MIN_SYNC_CODE_LENGTH ||
+      syncCode.length > 128 ||
+      deviceName.length < 2 ||
+      deviceName.length > 80
+    ) {
       reply.code(400);
-      return { error: 'syncCode und deviceName sind erforderlich.' };
+      return { error: 'Sync-Code muss 16 bis 128 Zeichen und der Gerätename 2 bis 80 Zeichen lang sein.' };
     }
 
     const syncCodeHash = hashValue(syncCode);
@@ -251,10 +318,18 @@ export async function createServer(options = {}) {
 
   app.post('/v1/sync/push', async (request, reply) => {
     const body = request.body && typeof request.body === 'object' ? request.body : {};
-    const incomingChanges = Array.isArray(body.changes) ? body.changes : [];
+    if (!Array.isArray(body.changes)) {
+      reply.code(400);
+      return { error: 'Änderungen müssen als Liste übermittelt werden.' };
+    }
+    const incomingChanges = body.changes;
     if (incomingChanges.length > 1000) {
       reply.code(400);
       return { error: 'Zu viele Änderungen in einem Request.' };
+    }
+    if (!incomingChanges.every(validateChange)) {
+      reply.code(400);
+      return { error: 'Ungültige Änderung; der gesamte Request wurde abgelehnt.' };
     }
 
     const { householdId, deviceId } = request.syncContext;
@@ -262,15 +337,10 @@ export async function createServer(options = {}) {
 
     const applyTransaction = db.transaction((changes) => {
       for (const rawChange of changes) {
-        if (!rawChange || typeof rawChange !== 'object') continue;
         const entityType = String(rawChange.entityType || '');
         const entityId = String(rawChange.entityId || '');
         const op = String(rawChange.op || '');
         const updatedAt = String(rawChange.updatedAt || '');
-
-        if (!ENTITY_TYPES.has(entityType)) continue;
-        if (!OPERATIONS.has(op)) continue;
-        if (!entityId || !updatedAt) continue;
 
         const payload =
           op === 'upsert' && rawChange.payload && typeof rawChange.payload === 'object'

@@ -33,6 +33,7 @@ app/
 
 # Local sync backend data
 sync-backend/data/
+sync-backend/certs/
 
 # Logs
 *.log
